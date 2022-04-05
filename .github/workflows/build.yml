@@ -1,0 +1,144 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/stephank/docker-lg-webos-ndk
+    steps:
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: webos
+          max-size: 1G
+
+      - name: Checkout libplist
+        uses: actions/checkout@v2
+        with:
+          repository: libimobiledevice/libplist
+          ref: 2.2.0
+          path: libplist
+
+      - name: Build libplist
+        run: |
+          cd ./libplist/
+          ./autogen.sh --host=arm-webos-linux-gnueabi --prefix=/usr --without-cython
+          make -j2
+          make install "DESTDIR=$OECORE_TARGET_SYSROOT"
+
+      - name: Checkout openssl
+        uses: actions/checkout@v2
+        with:
+          repository: openssl/openssl
+          ref: OpenSSL_1_1_1n
+          path: openssl
+
+      - name: Build openssl
+        run: |
+          cd ./openssl/
+          CROSS_COMPILE= ./Configure linux-armv4 --prefix=/usr
+          make -j2
+          make install_sw "DESTDIR=$OECORE_TARGET_SYSROOT"
+
+      - name: Cache downloads
+        uses: actions/cache@v3
+        with:
+          path: |
+            mDNSResponder-*.tar.gz
+          key: downloads
+
+      - name: Build mDNSResponder
+        env:
+          MDNS_VERSION: "1310.140.1"
+        run: |
+          if [ ! -e "./mDNSResponder-${MDNS_VERSION}.tar.gz" ]; then
+            rm -f ./mDNSResponder-*.tar.gz
+            wget "https://opensource.apple.com/tarballs/mDNSResponder/mDNSResponder-${MDNS_VERSION}.tar.gz"
+          fi
+
+          tar -xzf "./mDNSResponder-${MDNS_VERSION}.tar.gz"
+          cd "./mDNSResponder-${MDNS_VERSION}/mDNSPosix/"
+
+          # Only specific targets we need, because other targets may fail.
+          make -j2 Daemon libdns_sd os=linux "CC=$CC" "LD=$LD" "ST=$STRIP"
+
+          # Don't need to install everything.
+          cp ./build/prod/mdnsd "$OECORE_TARGET_SYSROOT/usr/sbin/"
+          cp ./build/prod/libdns_sd.so "$OECORE_TARGET_SYSROOT/usr/lib/"
+          cp ../mDNSShared/dns_sd.h "$OECORE_TARGET_SYSROOT/usr/include/"
+
+      - name: Checkout UxPlay
+        uses: actions/checkout@v2
+        with:
+          path: UxPlay
+
+      - name: Build UxPlay
+        run: |
+          mkdir UxPlay/build
+          cd UxPlay/build/
+
+          cat > ./cross_toolchain.cmake << 'EOF'
+          set(CMAKE_SYSTEM_NAME Linux)
+          set(CMAKE_SYSTEM_PROCESSOR arm)
+
+          set(CMAKE_SYSROOT $ENV{OECORE_TARGET_SYSROOT})
+          set(CMAKE_STAGING_PREFIX $ENV{OECORE_TARGET_SYSROOT})
+
+          # NOTE: This recreates some of the SDK environment settings, but
+          # that's not ideal. Maybe instead we can derive them somehow?
+          set(cross_prefix $ENV{OECORE_NATIVE_SYSROOT}/usr/bin/arm-webos-linux-gnueabi/arm-webos-linux-gnueabi-)
+          set(CMAKE_C_COMPILER ${cross_prefix}gcc)
+          set(CMAKE_CXX_COMPILER ${cross_prefix}g++)
+
+          set(cc_args -march=armv7-a -mfpu=neon -mfloat-abi=softfp)
+          set(CMAKE_C_FLAGS ${cc_args})
+          set(CMAKE_CXX_FLAGS ${cc_args})
+
+          set(CMAKE_C_COMPILER_LAUNCHER ccache)
+          set(CMAKE_CXX_COMPILER_LAUNCHER ccache)
+
+          set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+          set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+          set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+          set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+
+          set(PKG_CONFIG_EXECUTABLE $ENV{OECORE_NATIVE_SYSROOT}/usr/bin/pkg-config)
+          EOF
+
+          cmake ../ \
+            -DCMAKE_TOOLCHAIN_FILE=./cross_toolchain.cmake \
+            -DNO_MARCH_NATIVE=ON \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN'
+          make -j2
+
+      - name: Collect artifacts
+        run: |
+          mkdir ./result
+          RESULT="$PWD/result"
+
+          cp ./UxPlay/build/uxplay "$RESULT/"
+
+          # NOTE: We use cp instead of mv to follow symlinks.
+          cd "$OECORE_TARGET_SYSROOT/"
+          cp ./usr/sbin/mdnsd "$RESULT/"
+          cp ./usr/lib/libplist-2.0.so.3 "$RESULT/"
+          cp ./usr/lib/libcrypto.so.1.1 "$RESULT/"
+          cp ./usr/lib/libdns_sd.so "$RESULT/"
+          # NOTE: The SDK libstdc++ is newer than some LG TVs.
+          cp ./usr/lib/libstdc++.so.6 "$RESULT/"
+
+          cd "$RESULT/"
+          chmod a+x ./*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: uxplay-binaries
+          path: result/*

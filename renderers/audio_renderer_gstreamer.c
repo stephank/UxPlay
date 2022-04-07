@@ -51,7 +51,7 @@ static gboolean check_plugins (void)
     int i;
     gboolean ret;
     GstRegistry *registry;
-    const gchar *needed[] = { "app", "libav", "playback", "autodetect", NULL};
+    const gchar *needed[] = { "app", "libav", "playback", NULL};
 
     registry = gst_registry_get ();
     ret = TRUE;
